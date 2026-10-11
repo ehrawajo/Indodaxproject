@@ -12,6 +12,7 @@ from lib.db import db
 from models.schemas import (
     CandleSeries,
     CurrentAnalysis,
+    LiveProgress,
     PricePoint,
     RefreshIn,
     Snapshot,
@@ -46,6 +47,16 @@ async def current_analysis(kind: str = Query("daily")):
     # Nothing locked yet for this window — kick generation in the background and say so.
     asyncio.create_task(engine.ensure_current(now_utc()))
     return CurrentAnalysis(kind=kind, period_start=start, period_end=end, generating=True, snapshot=None)
+
+
+@router.get("/live", response_model=LiveProgress)
+async def live_window_progress(kind: str = Query("daily"), _user: dict = Depends(get_current_user)):
+    """High live + kenaikan aktual sepanjang window yang sedang berjalan."""
+    _check_kind(kind)
+    data = await engine.live_progress(kind)
+    if not data:
+        raise HTTPException(status_code=404, detail="Belum ada snapshot untuk periode ini")
+    return LiveProgress(**data)
 
 
 @router.get("/history", response_model=list[SnapshotSummary])

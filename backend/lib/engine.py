@@ -248,28 +248,102 @@ async def ensure_current(now: datetime | None = None) -> bool:
 
 
 async def record_running_actuals(tickers: dict[str, dict[str, float]], now: datetime) -> None:
-    """Track the running max high for every live snapshot (weekly highs need sampling)."""
-    for kind in ("daily", "weekly"):
-        start, end = _snap_coord(kind, now)
-        snap = await db.snapshots.find_one(
-            {"kind": kind, "period_start": start, "actuals_recorded": False}
-        )
-        if not snap:
-            continue
-        running = snap.get("actuals_running") or {}
-        changed = False
-        for it in snap.get("items") or []:
-            t = tickers.get(it["pair"])
-            if not t:
-                continue
-            cur = float((running.get(it["pair"]) or {}).get("high") or 0.0)
-            if t["high"] > cur:
-                running[it["pair"]] = {"high": t["high"], "at": now}
-                changed = True
-        if changed:
-            await db.snapshots.update_one(
-                {"_id": snap["_id"]}, {"$set": {"actuals_running": running}}
-            )
+    """Deprecated no-op.
+
+    A stored running maximum proved unsafe: it could never come back down, so one write
+    with the wrong semantics (the ticker's rolling 24h high, which can predate the 06:00
+    WITA window) permanently inflated the actual gain. In-window highs are now recomputed
+    from window-filtered sources on every read — see window_high(). Kept as a no-op so any
+    in-flight caller stays harmless.
+    """
+    return None
+
+
+async def _sampled_highs(pairs: list[str], start: datetime, end: datetime) -> dict[str, dict]:
+    """Max sampled price per pair inside [start, end) from our own price_history.
+
+    Returns {pair: {"high": float, "at": datetime}} — `at` is when that high was sampled.
+    """
+    if not pairs:
+        return {}
+    projection: dict[str, int] = {f"prices.{p}": 1 for p in pairs}
+    projection["ts"] = 1
+    docs = await db.price_history.find(
+        {"ts": {"$gte": start, "$lt": end}}, projection
+    ).to_list(2000)
+    out: dict[str, dict] = {}
+    for d in docs:
+        prices = d.get("prices") or {}
+        ts = _aware(d["ts"])
+        for p in pairs:
+            v = prices.get(p)
+            if v and float(v) > (out.get(p, {}).get("high") or 0.0):
+                out[p] = {"high": float(v), "at": ts}
+    return out
+
+
+async def _trade_highs(
+    client: httpx.AsyncClient, pairs: list[str], start: datetime
+) -> dict[str, float]:
+    """Max traded price per pair at/after `start`, straight from Indodax trades.
+
+    Fills the gaps between our samples — the trade feed carries every print.
+    """
+    start_ts = start.timestamp()
+
+    async def one(pair: str) -> tuple[str, float]:
+        try:
+            trades = await market.get_trades(client, pair.replace("_", ""))
+            highs = [t["price"] for t in trades if t["ts"] >= start_ts]
+            return pair, max(highs) if highs else 0.0
+        except Exception:
+            return pair, 0.0
+
+    sem = market.candidate_sem
+
+    async def guarded(pair: str) -> tuple[str, float]:
+        async with sem:
+            return await one(pair)
+
+    results = await asyncio.gather(*(guarded(p) for p in pairs))
+    return {p: v for p, v in results if v > 0}
+
+
+async def window_high(
+    items: list[dict],
+    start: datetime,
+    end: datetime,
+    tickers: dict[str, dict[str, float]],
+    trade_highs: dict[str, float] | None = None,
+) -> dict[str, dict]:
+    """True in-window high per pair, from window-filtered Indodax sources only.
+
+    Deliberately does NOT consult a stored running maximum: such a value cannot be
+    re-verified, and a single bad write (e.g. a rolling 24h high that predates the window)
+    would stick forever because a running max never comes back down. Every source here is
+    filtered to [start, end) and recomputed from scratch on each call.
+    """
+    pairs = [it["pair"] for it in items]
+    sampled = await _sampled_highs(pairs, start, end)
+    by_pair: dict[str, dict] = {}
+    for it in items:
+        pair = it["pair"]
+        entry = float(it.get("entry_price") or 0.0)
+        best = entry
+        at: datetime | None = None
+
+        s = sampled.get(pair)
+        if s and s["high"] > best:
+            best, at = s["high"], s["at"]
+        th = (trade_highs or {}).get(pair)
+        if th and th > best:
+            best, at = th, None  # trade feed: precise price, timestamp not tracked
+        t = tickers.get(pair)
+        if t and t["last"] > best:
+            best, at = t["last"], None
+
+        by_pair[pair] = {"high": best, "at": at, "last": t["last"] if t else None}
+    return by_pair
 
 
 async def finalize_due(now: datetime | None = None) -> int:
@@ -284,45 +358,138 @@ async def finalize_due(now: datetime | None = None) -> int:
     async with httpx.AsyncClient(follow_redirects=True) as client:
         tickers = await market.get_ticker_all(client)
 
-    finalized = 0
-    for snap in pending:
-        if not snap.get("items"):
+        finalized = 0
+        for snap in pending:
+            if not snap.get("items"):
+                await db.snapshots.update_one(
+                    {"_id": snap["_id"]},
+                    {"$set": {"actuals_recorded": True, "approximated": True, "actuals": {}}},
+                )
+                continue
+            start = _aware(snap["period_start"])
+            end = _aware(snap["period_end"])
+            late = (now - end).total_seconds() > 2 * 3600
+            # same high computation the live view shows, so the locked result matches it
+            trade_highs = {} if late else await _trade_highs(
+                client, [it["pair"] for it in snap["items"]], start
+            )
+            highs = await window_high(snap["items"], start, end, tickers, trade_highs)
+
+            rows: dict[str, dict] = {}
+            for it in snap["items"]:
+                tid = it["pair"]
+                entry = it["entry_price"] or 1e-12
+                actual_high = max(float(highs.get(tid, {}).get("high") or 0.0), it["entry_price"])
+                actual_pct = (actual_high - entry) / entry * 100.0
+                rows[tid] = {
+                    "pair": tid,
+                    "entry_price": it["entry_price"],
+                    "actual_high": round(actual_high, 8),
+                    "actual_pct": round(actual_pct, 2),
+                    "projected_pct": it["est_gain_pct"],
+                    "deviation_pct": round(actual_pct - it["est_gain_pct"], 2),
+                    "target_hit": bool(actual_high >= it["target_price"]),
+                    "recorded_at": now,
+                }
             await db.snapshots.update_one(
                 {"_id": snap["_id"]},
-                {"$set": {"actuals_recorded": True, "approximated": True, "actuals": {}}},
+                {"$set": {
+                    "actuals": rows,
+                    "actuals_recorded": True,
+                    "approximated": late,
+                    "evaluated_at": now,
+                }},
             )
-            continue
-        running = snap.get("actuals_running") or {}
-        late = (now - _aware(snap["period_end"])).total_seconds() > 2 * 3600
-        rows: dict[str, dict] = {}
-        for it in snap["items"]:
-            tid = it["pair"]
-            t = tickers.get(tid)
-            entry = it["entry_price"] or 1e-12
-            rh = float((running.get(tid) or {}).get("high") or 0.0)
-            actual_high = max(rh, t["high"] if t else 0.0, it["entry_price"])
-            actual_pct = (actual_high - entry) / entry * 100.0
-            rows[tid] = {
-                "pair": tid,
-                "entry_price": it["entry_price"],
-                "actual_high": round(actual_high, 8),
-                "actual_pct": round(actual_pct, 2),
-                "projected_pct": it["est_gain_pct"],
-                "deviation_pct": round(actual_pct - it["est_gain_pct"], 2),
-                "target_hit": bool(actual_high >= it["target_price"]),
-                "recorded_at": now,
-            }
-        await db.snapshots.update_one(
-            {"_id": snap["_id"]},
-            {"$set": {
-                "actuals": rows,
-                "actuals_recorded": True,
-                "approximated": late,
-                "evaluated_at": now,
-            }},
-        )
-        finalized += 1
+            finalized += 1
     return finalized
+
+
+async def live_progress(kind: str) -> dict | None:
+    """Live in-window performance of the current locked snapshot.
+
+    "High live" is the highest price reached since the window opened — 06:00 WITA today for
+    daily, Monday 06:00 WITA for weekly — and "kenaikan aktual" is that high measured against
+    the entry price recorded when the snapshot was locked.
+    """
+    cache_key = f"live_{kind}"
+    cached = _detail_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    now = now_utc()
+    start, end = _snap_coord(kind, now)
+    snap = await db.snapshots.find_one({"kind": kind, "period_start": start})
+    if not snap or not snap.get("items"):
+        return None
+
+    items = snap["items"]
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        tickers = await market.get_ticker_all(client)
+        trade_highs = await _trade_highs(client, [it["pair"] for it in items], start)
+    highs = await window_high(items, start, end, tickers, trade_highs)
+
+    rows = []
+    for it in items:
+        pair = it["pair"]
+        entry = float(it["entry_price"]) or 1e-12
+        info = highs.get(pair) or {}
+        high = float(info.get("high") or entry)
+        last = info.get("last")
+        live_gain = (high - entry) / entry * 100.0
+        current_gain = ((float(last) - entry) / entry * 100.0) if last else None
+        projected = float(it["est_gain_pct"])
+        levels = it.get("levels") or {}
+
+        tp_reached = 0
+        for idx, key in enumerate(("tp1", "tp2", "tp3"), start=1):
+            if levels.get(key) and high >= float(levels[key]):
+                tp_reached = idx
+        sl_touched = bool(levels.get("stop_loss") and last and float(last) <= float(levels["stop_loss"]))
+
+        rows.append({
+            "pair": pair,
+            "name": it.get("name") or pair.split("_")[0].upper(),
+            "rank": it.get("rank", 0),
+            "entry_price": it["entry_price"],
+            "last_price": last,
+            "live_high": round(high, 8),
+            "live_high_at": aware_or_none(info.get("at")),
+            "live_gain_pct": round(live_gain, 2),
+            "current_gain_pct": round(current_gain, 2) if current_gain is not None else None,
+            "projected_pct": projected,
+            "achieved_ratio": round(live_gain / projected * 100.0, 1) if projected > 0 else None,
+            "target_hit": bool(high >= float(it["target_price"])),
+            "tp_reached": tp_reached,
+            "sl_touched": sl_touched,
+        })
+
+    n = len(rows)
+    summary = {
+        "coins": n,
+        "avg_live_gain_pct": round(sum(r["live_gain_pct"] for r in rows) / n, 2) if n else 0.0,
+        "avg_projected_pct": round(sum(r["projected_pct"] for r in rows) / n, 2) if n else 0.0,
+        "positive_count": sum(1 for r in rows if r["live_gain_pct"] > 0),
+        "target_hit_count": sum(1 for r in rows if r["target_hit"]),
+        "tp1_count": sum(1 for r in rows if r["tp_reached"] >= 1),
+        "tp2_count": sum(1 for r in rows if r["tp_reached"] >= 2),
+        "tp3_count": sum(1 for r in rows if r["tp_reached"] >= 3),
+        "sl_count": sum(1 for r in rows if r["sl_touched"]),
+        "best": max(rows, key=lambda r: r["live_gain_pct"])["name"] if rows else None,
+    }
+
+    out = {
+        "kind": kind,
+        "period_start": start,
+        "period_end": end,
+        "updated_at": now,
+        "window_label": (
+            "sejak 06:00 WITA hari ini" if kind == "daily" else "sejak Senin 06:00 WITA"
+        ),
+        "rows": rows,
+        "summary": summary,
+    }
+    _detail_cache.set(cache_key, out, 60)
+    return out
 
 
 # ---------- live coin detail (on-demand, not a locked snapshot) ----------

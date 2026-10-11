@@ -40,7 +40,6 @@ async def sample_market(now) -> bool:
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
             tickers = await market.get_ticker_all(client)
-        await engine.record_running_actuals(tickers, now)
         prices = {tid: t["last"] for tid, t in tickers.items() if t["last"] > 0}
         if prices:
             await db.price_history.insert_one({"ts": now, "prices": prices})

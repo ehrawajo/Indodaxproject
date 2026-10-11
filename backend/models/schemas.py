@@ -290,6 +290,46 @@ class MonthlyEvalResponse(BaseModel):
     overall: MonthlyOverall
 
 
+class LiveRow(BaseModel):
+    pair: str
+    name: str
+    rank: int = 0
+    entry_price: float
+    last_price: float | None = None
+    live_high: float
+    live_high_at: datetime | None = None
+    live_gain_pct: float
+    current_gain_pct: float | None = None
+    projected_pct: float
+    achieved_ratio: float | None = None
+    target_hit: bool = False
+    tp_reached: int = 0
+    sl_touched: bool = False
+
+
+class LiveSummary(BaseModel):
+    coins: int = 0
+    avg_live_gain_pct: float = 0.0
+    avg_projected_pct: float = 0.0
+    positive_count: int = 0
+    target_hit_count: int = 0
+    tp1_count: int = 0
+    tp2_count: int = 0
+    tp3_count: int = 0
+    sl_count: int = 0
+    best: str | None = None
+
+
+class LiveProgress(BaseModel):
+    kind: str
+    period_start: datetime
+    period_end: datetime
+    updated_at: datetime
+    window_label: str
+    rows: list[LiveRow] = []
+    summary: LiveSummary
+
+
 # ---------- watchlist ----------
 
 

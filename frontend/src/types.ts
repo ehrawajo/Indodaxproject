@@ -213,6 +213,46 @@ export interface MonthlyEvalResponse {
   overall: MonthlyOverall;
 }
 
+export interface LiveRow {
+  pair: string;
+  name: string;
+  rank: number;
+  entry_price: number;
+  last_price: number | null;
+  live_high: number;
+  live_high_at: string | null;
+  live_gain_pct: number;
+  current_gain_pct: number | null;
+  projected_pct: number;
+  achieved_ratio: number | null;
+  target_hit: boolean;
+  tp_reached: number;
+  sl_touched: boolean;
+}
+
+export interface LiveSummary {
+  coins: number;
+  avg_live_gain_pct: number;
+  avg_projected_pct: number;
+  positive_count: number;
+  target_hit_count: number;
+  tp1_count: number;
+  tp2_count: number;
+  tp3_count: number;
+  sl_count: number;
+  best: string | null;
+}
+
+export interface LiveProgress {
+  kind: string;
+  period_start: string;
+  period_end: string;
+  updated_at: string;
+  window_label: string;
+  rows: LiveRow[];
+  summary: LiveSummary;
+}
+
 export interface WatchlistEntry {
   pair: string;
   coin: string;
